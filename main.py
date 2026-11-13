@@ -1,13 +1,9 @@
-#!/usr/bin/env python3
-"""Write our happiest picture to the make.fun output location.
+"""Carry the bundled picture to the runner's output folder.
 
-The picture ships in this repository as ``entry.png`` next to this file.
-Before copying, the program checks the file against the competition's
-own limits (a whole PNG or JPEG, at most 1 MiB, at most 1024 by 1024
-pixels), then copies it, byte for byte, to ``entry.png`` inside the
-output directory (``MAKEFUN_OUTPUT_DIR`` when set, otherwise
-``/output``). Two runs always write the same bytes: the source file is
-never modified.
+The picture sits next to this file under the name ``entry.png`` even
+though its actual encoding may be JPEG.  Before copying, we peek at
+the header ourselves, confirm the file is not oversized, and make
+sure both sides fit inside the allowed square.
 """
 
 import os
@@ -15,67 +11,98 @@ import struct
 import sys
 from pathlib import Path
 
-SOURCE = Path(__file__).resolve().with_name("entry.png")
-MAX_BYTES = 1_048_576
-MAX_SIDE = 1024
-PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
-JPEG_SIGNATURE = b"\xff\xd8\xff"
+BYTE_LIMIT = 1_048_576
+SIDE_LIMIT = 1024
+
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+JPEG_MAGIC = b"\xff\xd8"
 
 
-def png_dimensions(data: bytes) -> tuple[int, int]:
-    """Read (width, height) from the PNG IHDR chunk."""
-    if len(data) < 24 or data[12:16] != b"IHDR":
-        raise ValueError("PNG file has no IHDR chunk")
-    return struct.unpack(">II", data[16:24])
+def abort(reason: str) -> None:
+    print(f"entry check failed: {reason}", file=sys.stderr)
+    raise SystemExit(1)
 
 
-def jpeg_dimensions(data: bytes) -> tuple[int, int]:
-    """Read (width, height) from the first JPEG SOF0/SOF2 segment."""
-    pos = 2
-    while pos + 4 <= len(data):
-        if data[pos] != 0xFF:
-            raise ValueError("JPEG segment does not start with a marker")
-        marker = data[pos + 1]
-        length = struct.unpack(">H", data[pos + 2 : pos + 4])[0]
+def png_dimensions(blob: bytes) -> tuple[int, int]:
+    # Layout: 8 byte signature, then the IHDR chunk header, then W/H.
+    if len(blob) < 24:
+        abort("PNG data is too short to contain an IHDR header")
+    if blob[12:16] != b"IHDR":
+        abort("PNG data is missing its IHDR chunk")
+    wide, tall = struct.unpack(">II", blob[16:24])
+    return wide, tall
+
+
+def jpeg_dimensions(blob: bytes) -> tuple[int, int]:
+    # Walk marker segments until a start-of-frame segment turns up.
+    cursor = 2
+    total = len(blob)
+    while cursor + 1 < total:
+        if blob[cursor] != 0xFF:
+            abort("JPEG segment does not begin with a marker prefix")
+        marker = blob[cursor + 1]
+        # Padding bytes show up as repeated 0xFF values.
+        if marker == 0xFF:
+            cursor += 1
+            continue
+        # Standalone markers carry no length field at all.
+        if marker in (0x01, 0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
+            cursor += 2
+            continue
+        if cursor + 3 >= total:
+            abort("JPEG segment header is truncated")
+        seg_len = struct.unpack(">H", blob[cursor + 2 : cursor + 4])[0]
+        if seg_len < 2:
+            abort("JPEG segment declares an impossible length")
         if marker in (0xC0, 0xC2):
-            height, width = struct.unpack(">HH", data[pos + 5 : pos + 9])
-            return width, height
-        pos += 2 + length
-    raise ValueError("JPEG file has no SOF segment")
+            if cursor + 8 >= total:
+                abort("JPEG frame header is truncated")
+            tall = struct.unpack(">H", blob[cursor + 5 : cursor + 7])[0]
+            wide = struct.unpack(">H", blob[cursor + 7 : cursor + 9])[0]
+            return wide, tall
+        if marker == 0xDA:
+            break
+        cursor += 2 + seg_len
+    abort("JPEG data has no readable frame header")
+    return 0, 0  # unreachable; keeps type checkers quiet
 
 
-def check_image(data: bytes) -> str:
-    """Validate size and dimensions; return the detected format name."""
-    if len(data) > MAX_BYTES:
-        raise ValueError(f"image is {len(data)} bytes, over the {MAX_BYTES} cap")
-    if data.startswith(PNG_SIGNATURE):
-        width, height = png_dimensions(data)
-        kind = "PNG"
-    elif data.startswith(JPEG_SIGNATURE):
-        width, height = jpeg_dimensions(data)
-        kind = "JPEG"
-    else:
-        found = data[:4].hex() if data else "no bytes (empty file)"
-        raise ValueError(f"unsupported image format: found {found}")
-    if width > MAX_SIDE or height > MAX_SIDE:
-        raise ValueError(f"image is {width}x{height}, over the {MAX_SIDE}px cap")
-    return f"{kind} {width}x{height}"
+def measure(blob: bytes) -> tuple[int, int]:
+    if blob.startswith(PNG_MAGIC):
+        return png_dimensions(blob)
+    if blob.startswith(JPEG_MAGIC):
+        return jpeg_dimensions(blob)
+    abort("bundled file is neither PNG nor JPEG")
+    return 0, 0  # unreachable
 
 
-def main() -> int:
-    data = SOURCE.read_bytes()
-    description = check_image(data)
-    output_dir = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
-    output_dir.mkdir(parents=True, exist_ok=True)
-    target = output_dir / "entry.png"
-    with target.open("wb") as handle:
-        handle.write(data)
-    written = target.stat().st_size
-    if written != len(data):
-        raise IOError(f"wrote {written} of {len(data)} bytes to {target}")
-    print(f"wrote {target} ({written} bytes, {description})")
-    return 0
+def main() -> None:
+    here = Path(__file__).resolve().parent
+    source = here / "entry.png"
+    if not source.is_file():
+        abort(f"bundled image not found beside script: {source}")
+
+    payload = source.read_bytes()
+    if len(payload) > BYTE_LIMIT:
+        abort(f"image weighs {len(payload)} bytes, over the {BYTE_LIMIT} limit")
+    if not payload:
+        abort("bundled image is empty")
+
+    wide, tall = measure(payload)
+    for label, value in (("width", wide), ("height", tall)):
+        if value < 1 or value > SIDE_LIMIT:
+            abort(f"image {label} is {value}, outside 1..{SIDE_LIMIT}")
+
+    target_dir = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        abort(f"cannot create output directory {target_dir}: {exc}")
+
+    destination = target_dir / "entry.png"
+    destination.write_bytes(payload)
+    print(f"Delivered entry.png: {len(payload)} bytes, {wide}x{tall} -> {destination}")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
