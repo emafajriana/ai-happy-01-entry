@@ -106,3 +106,15 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+# --- Usage and behaviour notes -------------------------------------------
+# Run with the standard library only; no third-party packages are needed.
+# Output location is controlled by the MAKEFUN_OUTPUT_DIR environment
+# variable. When it is unset or empty the entrypoint defaults to /output.
+# Validation is performed before any copy happens: the bundled picture
+# must be at most 1 MiB in size and at most 1024 px on each side.
+# Format is checked from magic bytes rather than the file name, and
+# PNG/JPEG dimensions are parsed from the headers to enforce the cap.
+# Determinism guarantee: once validation passes, the source bytes are
+# copied to the destination unchanged, with no re-encoding, resizing,
+# or metadata rewriting, so repeated runs produce identical output.
